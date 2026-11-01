@@ -6,9 +6,6 @@ __pycache__/
 .idea/
 .vscode/
 datasets/
-outputs/
-pretrained/
-*.pt
 *.pth
 *.task
 *.npy
