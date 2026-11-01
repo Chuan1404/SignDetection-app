@@ -1,0 +1,328 @@
+import os
+import time
+
+import cv2 as cv
+from flask import Response, jsonify, render_template, send_file
+
+from app.utils import (
+    draw_action_zones,
+    draw_start_zone,
+    get_start_zone,
+    point_in_zone,
+    wrist_in_zone,
+)
+from config import _COORD_DIM, BACKSPACE_ZONE, CLEAR_ZONE, FRAME_H, FRAME_W, MIN_SIGN_ZONE_SECONDS
+from app.candidate_picker import CandidatePicker
+
+_ZONE_ANCHOR_POSE_IDX = (11, 12)
+
+
+class SignDetectionApp:
+    def __init__(self, flask_app, service, camera, gloss_list, wlasl_video_dir):
+        self.app = flask_app
+        self.service = service
+        self.camera = camera
+        self.gloss_list = gloss_list
+        self.wlasl_video_dir = wlasl_video_dir
+
+        self.predicted_text = []
+        self.picker = CandidatePicker()
+        self.wait_for_release = False
+        self.resume_at = 0.0
+
+        self.register_routes()
+
+    def register_routes(self):
+        self.app.add_url_rule("/", "index", self.index)
+        self.app.add_url_rule("/video", "video", self.video)
+        self.app.add_url_rule(
+            "/predicted_text", "predicted_text", self.get_predicted_text
+        )
+        self.app.add_url_rule("/glosses", "glosses", self.get_glosses)
+        self.app.add_url_rule("/video_file/<video_id>", "video_file", self.serve_video)
+        self.app.add_url_rule(
+            "/clear_text", "clear_text", self.clear_text, methods=["POST"]
+        )
+
+    def index(self):
+        return render_template("index.html")
+
+    def video(self):
+        return Response(
+            self.generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame"
+        )
+
+    def get_predicted_text(self):
+        return jsonify(words=self.predicted_text, choosing=self.picker.active)
+
+    def get_glosses(self):
+        return jsonify(glosses=self.gloss_list)
+
+    def clear_text(self):
+        self.predicted_text.clear()
+        self.picker.clear()
+        self.wait_for_release = True
+        self.resume_at = time.monotonic() + 0.75
+        return jsonify(ok=True)
+
+    def serve_video(self, video_id):
+
+        if not video_id.isalnum():
+            return "Bad Request", 400
+
+        path = os.path.join(self.wlasl_video_dir, f"{video_id}.mp4")
+
+        if not os.path.exists(path):
+            return "Not Found", 404
+
+        return send_file(path, mimetype="video/mp4")
+
+    def generate_frames(self):
+
+        recording = False
+        frame_index = 0
+        wait_missing = 0
+        in_zone_since = None
+        valid_sign = False
+
+        pose_buf = []
+        right_hand_buf = []
+        left_hand_buf = []
+
+        backspace_frames = 0
+        clear_frames = 0
+
+        ACTION_HOLD = 10
+
+        backspace_triggered = False
+        clear_triggered = False
+
+        while True:
+            success, frame = self.camera.read()
+
+            if not success:
+                break
+
+            frame = cv.resize(frame, (FRAME_W, FRAME_H))
+
+            frame_h, frame_w = frame.shape[:2]
+
+            start_zone = get_start_zone(frame_w, frame_h)
+
+            rgb_frame = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+
+            timestamp_ms = int(cv.getTickCount() / cv.getTickFrequency() * 1000)
+
+            # -------------------------
+            # Detection
+            # -------------------------
+
+            hand_results, pose_results = self.service.detect(
+                rgb_frame,
+                timestamp_ms,
+            )
+
+            (
+                _detection_hand_results,
+                left_coors,
+                right_coors,
+                left_detected,
+                right_detected,
+            ) = hand_results
+
+            (
+                _detection_pose_results,
+                pose_coors,
+                pose_detected,
+            ) = pose_results
+
+            # -------------------------
+            # Zone condition
+            # -------------------------
+
+            right_in_zone = right_detected and point_in_zone(
+                right_coors[0, 0] * frame_w,
+                right_coors[0, 1] * frame_h,
+                start_zone,
+            )
+
+            left_in_zone = left_detected and point_in_zone(
+                left_coors[0, 0] * frame_w,
+                left_coors[0, 1] * frame_h,
+                start_zone,
+            )
+
+            pose_anchor_in_zone = pose_detected and all(
+                point_in_zone(
+                    pose_coors[idx, 0] * frame_w,
+                    pose_coors[idx, 1] * frame_h,
+                    start_zone,
+                )
+                for idx in _ZONE_ANCHOR_POSE_IDX
+            )
+
+            hand_in_zone = (right_in_zone or left_in_zone) and pose_anchor_in_zone
+            now = time.monotonic()
+            was_selecting = self.picker.active
+            pointer, pointer_hand = self.picker.pointer(
+                left_coors, right_coors, left_detected, right_detected, frame_w, frame_h
+            )
+            if was_selecting:
+                confirmed, word = self.picker.update(
+                    pointer, pointer_hand, now, frame_w, frame_h
+                )
+                if confirmed:
+                    if word is not None:
+                        self.predicted_text.append(word)
+                    self.wait_for_release = True
+                    self.resume_at = now + 0.75
+            elif self.wait_for_release and now >= self.resume_at and not hand_in_zone:
+                self.wait_for_release = False
+
+            # -------------------------
+            # Start recording
+            # -------------------------
+
+            if (not recording and hand_in_zone and not was_selecting
+                    and not self.picker.active and not self.wait_for_release):
+                recording = True
+                in_zone_since = now
+                valid_sign = False
+                frame_index = 0
+                wait_missing = 0
+
+                pose_buf = []
+                right_hand_buf = []
+                left_hand_buf = []
+
+            # -------------------------
+            # Recording
+            # -------------------------
+
+            if recording:
+                # Only time actually spent continuously in the zone qualifies.
+                # The trailing frames waiting for hands to leave do not count.
+                if hand_in_zone:
+                    if in_zone_since is None:
+                        in_zone_since = now
+                    if now - in_zone_since >= MIN_SIGN_ZONE_SECONDS:
+                        valid_sign = True
+                else:
+                    in_zone_since = None
+                pose_buf.append(pose_coors[:, :_COORD_DIM])
+                right_hand_buf.append(right_coors[:, :_COORD_DIM])
+                left_hand_buf.append(left_coors[:, :_COORD_DIM])
+
+                frame_index += 1
+
+                if not hand_in_zone:
+                    if wait_missing > 9:
+                        if valid_sign:
+                            candidates = self.service.predict_topk(
+                                pose_buf,
+                                left_hand_buf,
+                                right_hand_buf,
+                            )
+
+                            self.picker.show(candidates, time.monotonic())
+                            self.wait_for_release = True
+
+                        recording = False
+                        in_zone_since = None
+                        valid_sign = False
+                        wait_missing = 0
+                        frame_index = 0
+
+                        pose_buf = []
+                        right_hand_buf = []
+                        left_hand_buf = []
+
+                    wait_missing += 1
+                else:
+                    wait_missing = 0
+
+            # -------------------------
+            # Action zones
+            # -------------------------
+
+            actions_enabled = not (was_selecting or self.picker.active or self.wait_for_release)
+            any_in_backspace = actions_enabled and (wrist_in_zone(
+                right_coors, right_detected, BACKSPACE_ZONE
+            ) or wrist_in_zone(left_coors, left_detected, BACKSPACE_ZONE))
+
+            any_in_clear = actions_enabled and (wrist_in_zone(
+                right_coors, right_detected, CLEAR_ZONE
+            ) or wrist_in_zone(left_coors, left_detected, CLEAR_ZONE))
+
+            # Backspace
+
+            if any_in_backspace:
+                backspace_frames += 1
+
+                if backspace_frames == ACTION_HOLD and not backspace_triggered:
+                    if self.predicted_text:
+                        self.predicted_text.pop()
+
+                    backspace_triggered = True
+
+            else:
+                backspace_frames = 0
+                backspace_triggered = False
+
+            # Clear
+
+            if any_in_clear:
+                clear_frames += 1
+
+                if clear_frames == ACTION_HOLD and not clear_triggered:
+                    self.predicted_text.clear()
+                    clear_triggered = True
+
+            else:
+                clear_frames = 0
+                clear_triggered = False
+
+            # -------------------------
+            # Draw
+            # -------------------------
+
+            rgb_frame = self.service.draw(
+                rgb_frame,
+                hand_results,
+                pose_results,
+            )
+
+            frame = cv.cvtColor(rgb_frame, cv.COLOR_RGB2BGR)
+
+            display_frame = cv.flip(frame, 1)
+
+            if self.picker.active:
+                display_frame = self.picker.draw(display_frame, pointer)
+            else:
+                display_frame = draw_start_zone(display_frame, start_zone, recording)
+                display_frame = draw_action_zones(
+                    display_frame, any_in_backspace, any_in_clear
+                )
+                if self.wait_for_release:
+                    cv.putText(display_frame, "Move hands out of the start zone to continue",
+                               (12, frame_h - 15), cv.FONT_HERSHEY_SIMPLEX, 0.55,
+                               (255, 255, 255), 2, cv.LINE_AA)
+
+            # -------------------------
+            # JPEG
+            # -------------------------
+
+            ret, buffer = cv.imencode(
+                ".jpg",
+                display_frame,
+                [cv.IMWRITE_JPEG_QUALITY, 60],
+            )
+
+            if not ret:
+                continue
+
+            frame_bytes = buffer.tobytes()
+
+            yield (
+                b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
+            )

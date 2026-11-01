@@ -1,0 +1,69 @@
+import os
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+import json
+
+import cv2 as cv
+from flask import Flask
+
+from app.index import SignDetectionApp
+from app.services.SignDetectionService import SignDetectionService
+from app.utils import load_model
+from config import DATA_ROOT, LABEL_DIR, MODEL_PATH
+from app.landmarks import FusionComponent
+from app.detectors.hand_detection import HandDetection
+from app.detectors.pose_detection import PoseDetection
+from app.reference_videos import build_gloss_list
+
+
+def create_application():
+    flask_app = Flask(__name__, template_folder="templates", static_folder="static")
+
+    hand_detection = HandDetection()
+    pose_detection = PoseDetection()
+    fusion = FusionComponent()
+
+    label_dir = LABEL_DIR
+    wlasl_video_dir = os.path.join(DATA_ROOT, "raw", "WLASL", "videos")
+    model_path = MODEL_PATH
+
+    with open(
+        os.path.join(label_dir, "gloss2idx.json"),
+        "r",
+    ) as f:
+        gloss2idx = json.load(f)
+
+    idx2gloss = {v: k for k, v in gloss2idx.items()}
+
+    gloss_list = build_gloss_list(label_dir=label_dir, video_dir=wlasl_video_dir)
+    model = load_model(model_path=model_path, num_classes=len(gloss2idx))
+
+    service = SignDetectionService(
+        hand_detection=hand_detection,
+        pose_detection=pose_detection,
+        fusion=fusion,
+        model=model,
+        pretrained_model=None,
+        idx2gloss=idx2gloss,
+    )
+
+    camera = cv.VideoCapture(0, cv.CAP_DSHOW) if os.name == 'nt' else cv.VideoCapture(0)
+    application = SignDetectionApp(
+        flask_app=flask_app,
+        service=service,
+        camera=camera,
+        gloss_list=gloss_list,
+        wlasl_video_dir=wlasl_video_dir,
+    )
+
+    return application.app
+
+
+app = create_application()
+
+if __name__ == "__main__":
+    app.run(
+        debug=True,
+        use_reloader=False,
+    )

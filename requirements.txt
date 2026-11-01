@@ -1,0 +1,6 @@
+numpy==1.26.4
+torch==2.5.1
+mediapipe==0.10.33
+opencv-contrib-python==4.11.0.86
+Flask>=3.0,<4
+tqdm==4.66.5
